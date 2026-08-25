@@ -34,6 +34,9 @@ struct Run: ParsableCommand {
     @Option(name: .long, help: "Model id to use. Defaults to the recommended model.")
     var model: String?
 
+    @Flag(name: .long, help: "Skip the on-device AI cleanup pass (filler words, false starts).")
+    var noCleanup: Bool = false
+
     func run() throws {
         if !skipDoctor {
             let checks = DoctorReport.run()
@@ -76,6 +79,17 @@ struct Run: ParsableCommand {
         if let warmupError {
             FileHandle.standardError.write(Data("warmup failed: \(warmupError)\n".utf8))
             throw ExitCode(1)
+        }
+
+        let cleanupEnabled: Bool
+        if noCleanup {
+            cleanupEnabled = false
+        } else if let reason = TextCleaner.unavailableReason {
+            cleanupEnabled = false
+            FileHandle.standardError.write(Data("AI cleanup off: \(reason)\n".utf8))
+        } else {
+            cleanupEnabled = true
+            Task.detached { await TextCleaner.prewarm() }
         }
 
         let app = NSApplication.shared
@@ -134,13 +148,25 @@ struct Run: ParsableCommand {
                     Task {
                         let started = Date()
                         do {
-                            let text = try await transcriber.transcribe(samples)
+                            var text = try await transcriber.transcribe(samples)
                             let elapsed = Date().timeIntervalSince(started)
                             FileHandle.standardError.write(Data(
                                 String(format: "→ %.2fs · %@\n", elapsed, text).utf8
                             ))
+                            if cleanupEnabled {
+                                let cleanStarted = Date()
+                                let cleaned = await TextCleaner.clean(text)
+                                if cleaned != text {
+                                    let cleanElapsed = Date().timeIntervalSince(cleanStarted)
+                                    FileHandle.standardError.write(Data(
+                                        String(format: "✦ %.2fs · %@\n", cleanElapsed, cleaned).utf8
+                                    ))
+                                    text = cleaned
+                                }
+                            }
+                            let final = text
                             await MainActor.run {
-                                TextInjector.inject(text)
+                                TextInjector.inject(final)
                                 overlay?.hide()
                                 menuBar.setRecording(false)
                             }
@@ -169,7 +195,8 @@ struct Run: ParsableCommand {
         sigint.resume()
         signal(SIGINT, SIG_IGN)
 
-        FileHandle.standardError.write(Data("listening on fn hold · model: \(chosenModel.id) · ^C to quit\n".utf8))
+        let cleanupStatus = cleanupEnabled ? "on" : "off"
+        FileHandle.standardError.write(Data("listening on fn hold · model: \(chosenModel.id) · cleanup: \(cleanupStatus) · ^C to quit\n".utf8))
         app.run()
     }
 }
