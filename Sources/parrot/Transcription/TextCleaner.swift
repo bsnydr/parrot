@@ -43,7 +43,7 @@ enum TextCleaner {
         #if canImport(FoundationModels)
         if #available(macOS 26, *) {
             guard case .available = SystemLanguageModel.default.availability else { return }
-            let session = LanguageModelSession(instructions: instructions)
+            let session = LanguageModelSession(instructions: baseInstructions)
             _ = try? await session.respond(
                 to: "Input: hello there\nOutput:",
                 options: GenerationOptions(temperature: 0.2)
@@ -54,13 +54,16 @@ enum TextCleaner {
 
     /// Clean `text`. Returns the original text on any failure or timeout.
     static func clean(_ text: String) async -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
+        let entries = dictionaryEntries()
+        trimmed = applyCorrections(trimmed, entries: entries)
         #if canImport(FoundationModels)
         if #available(macOS 26, *) {
-            guard case .available = SystemLanguageModel.default.availability else { return text }
+            guard case .available = SystemLanguageModel.default.availability else { return trimmed }
             let words = trimmed.split(whereSeparator: \.isWhitespace).count
-            let session = LanguageModelSession(instructions: instructions)
+            let session = LanguageModelSession(
+                instructions: instructions(terms: entries.map(\.canonical)))
             // Low temperature keeps the rewrite deterministic; the token cap
             // scales with input so a runaway generation can't spin forever.
             let options = GenerationOptions(
@@ -83,22 +86,80 @@ enum TextCleaner {
                     out = String(out.dropFirst("Output:".count))
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                 }
-                return out.isEmpty ? text : out
+                return out.isEmpty ? trimmed : out
             } catch {
-                return text
+                return trimmed
             }
         }
         #endif
-        return text
+        return trimmed
     }
 
-    static let instructions = """
+    /// Personal dictionary: words and names the speaker uses that Whisper tends
+    /// to mishear. One entry per line, `#` for comments. Re-read on every
+    /// cleanup so edits apply from the next dictation.
+    static let dictionaryPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/parrot/dictionary.txt")
+
+    /// Parsed dictionary. A bare `Word` line is a spelling hint for the AI
+    /// pass; a `Word: mishear1, mishear2` line also becomes a hard replacement
+    /// applied in code before the AI sees the text.
+    static func dictionaryEntries() -> [(canonical: String, mishears: [String])] {
+        guard let raw = try? String(contentsOf: dictionaryPath, encoding: .utf8) else { return [] }
+        return raw.split(separator: "\n").compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return nil }
+            let parts = trimmed.split(separator: ":", maxSplits: 1)
+            let canonical = parts[0].trimmingCharacters(in: .whitespaces)
+            guard !canonical.isEmpty else { return nil }
+            let mishears = parts.count > 1
+                ? parts[1].split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                : []
+            return (canonical, mishears)
+        }
+    }
+
+    /// Case-insensitive whole-word replacement of known mishears.
+    /// Deterministic, and works even when the AI model is unavailable.
+    static func applyCorrections(
+        _ text: String,
+        entries: [(canonical: String, mishears: [String])]
+    ) -> String {
+        var out = text
+        for entry in entries {
+            for mishear in entry.mishears {
+                let pattern = "\\b" + NSRegularExpression.escapedPattern(for: mishear) + "\\b"
+                out = out.replacingOccurrences(
+                    of: pattern,
+                    with: entry.canonical,
+                    options: [.regularExpression, .caseInsensitive]
+                )
+            }
+        }
+        return out
+    }
+
+    static func instructions(terms: [String]) -> String {
+        guard !terms.isEmpty else { return baseInstructions }
+        return baseInstructions + """
+
+
+        The speaker uses these special words and names; prefer these exact \
+        spellings when a transcribed word sounds like one of them: \
+        \(terms.joined(separator: ", ")).
+        """
+    }
+
+    static let baseInstructions = """
     You clean up dictated text.
     - Remove filler words: um, uh, er, ah, and "like" or "you know" when used as filler.
     - Remove false starts and stuttered repeats; keep only the completed thought.
     - When the speaker corrects themselves, keep only the correction.
     - Fix punctuation and capitalization.
     - Never rephrase, summarize, shorten, or add content. Keep the speaker's own words and meaning.
+    - Output plain text only: never markdown, asterisks, or quotation marks around the text.
     - Output only the cleaned text, nothing else.
 
     Examples:
